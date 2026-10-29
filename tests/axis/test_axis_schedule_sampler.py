@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+
+# Importing lerobot.scripts.lerobot_train pulls in the policy factory, which registers
+# PreTrainedConfig subclasses (e.g. "act") as an import-time side effect. Without it,
+# `draccus.parse(..., "--policy.type", "act", ...)` below fails with "choose from ()" when
+# this file is the first to touch draccus.parse in a session -- see test_train_wirein.py,
+# which happens to get this for free because one of its earlier tests imports lerobot_train.
+import lerobot.scripts.lerobot_train  # noqa: F401
+
+
+def _schedule_npz(tmp_path, rows, n_rows=100, dtype=np.int64, meta_extra=None, name="sched.npz"):
+    """Write a schedule artifact shaped like the REAL one from the AXIS-QVLA schedule export:
+    `rows` is 2-D (total_steps, batch) -- NOT 1-D -- because that is what the export writes, and
+    `meta["n_rows"]` is the field the sampler binds to the dataset's frame count.
+    """
+    p = tmp_path / name
+    meta = {"n_rows": n_rows, "mode": "drop", "reward_id": "v2"}
+    if meta_extra:
+        meta.update(meta_extra)
+    np.savez(p, rows=np.asarray(rows, dtype=dtype), meta=np.array(json.dumps(meta)))
+    return p
+
+
+def test_replays_rows_in_exact_file_order(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    # 3 steps x 2 batch, row-major flatten -- repeats are legal (a schedule draws WITH replacement).
+    rows = [[5, 3], [5, 99], [0, 3]]
+    flat = [5, 3, 5, 99, 0, 3]
+    s = AxisScheduleSampler(str(_schedule_npz(tmp_path, rows)), expected_frames=100)
+    assert list(iter(s)) == flat
+    assert len(s) == 6
+    assert list(iter(s)) == flat  # second pass replays identically -- no consumption
+
+
+def test_refuses_resume(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    s = AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1, 2]])), expected_frames=100)
+    with pytest.raises(RuntimeError, match="resume"):
+        s.load_state_dict({"epoch": 0, "start_index": 1})
+
+
+def test_state_dict_is_a_noop_and_set_epoch_is_a_noop(tmp_path):
+    """The schedule IS the epoch structure: set_epoch must not perturb replay order, and
+    state_dict must not claim any position lerobot could later feed back through load_state_dict."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    s = AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1, 2], [3, 4]])), expected_frames=100)
+    assert s.state_dict() == {}
+    s.set_epoch(5)  # must not raise, must not change replay order
+    assert list(iter(s)) == [1, 2, 3, 4]
+
+
+def test_refuses_wrong_dtype(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    with pytest.raises(ValueError, match="dtype"):
+        AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1.0, 2.0]], dtype=np.float64)), expected_frames=100)
+
+
+def test_refuses_out_of_range_rows(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    with pytest.raises(ValueError, match="expected_frames|out of range"):
+        AxisScheduleSampler(str(_schedule_npz(tmp_path, [[100]])), expected_frames=100)
+
+
+def test_refuses_negative_rows(tmp_path):
+    """Torch indexes a negative int as 'from the end', so a negative row would silently draw
+    from the dataset tail instead of raising -- catch it at construction."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    with pytest.raises(ValueError, match="negative"):
+        AxisScheduleSampler(str(_schedule_npz(tmp_path, [[0, -1]])), expected_frames=100)
+
+
+def test_refuses_one_dimensional_rows(tmp_path):
+    """The artifact's `rows` key is 2-D (total_steps, batch); a 1-D array cannot be told apart
+    from a corrupt/pre-schedule artifact."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    with pytest.raises(ValueError, match="2-D"):
+        AxisScheduleSampler(str(_schedule_npz(tmp_path, [1, 2, 3])), expected_frames=100)
+
+
+def test_refuses_meta_mismatch(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    # meta says the schedule was drawn against a 50-row corpus; the dataset has 100 frames.
+    with pytest.raises(ValueError, match="n_rows"):
+        AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1, 2]], n_rows=50)), expected_frames=100)
+
+
+def test_refuses_missing_n_rows(tmp_path):
+    """An artifact with no recorded corpus size cannot be told apart from one built against a
+    different corpus, so absence is rejected exactly like a mismatch."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    p = tmp_path / "sched.npz"
+    np.savez(
+        p,
+        rows=np.asarray([[1, 2]], dtype=np.int64),
+        meta=np.array(json.dumps({"mode": "drop"})),
+    )
+    with pytest.raises(ValueError, match="n_rows"):
+        AxisScheduleSampler(str(p), expected_frames=100)
+
+
+def test_config_has_axis_schedule_field():
+    import dataclasses
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    fields = {f.name for f in dataclasses.fields(TrainPipelineConfig)}
+    assert "axis_schedule_path" in fields
+
+
+def test_config_exclusivity_schedule_and_rows():
+    """A schedule replay and a uniform row draw cannot both drive the sampler."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+            "--axis_rows_path",
+            "/tmp/r.npz",
+            "--axis_expected_frames",
+            "10",
+        ],
+    )
+    with pytest.raises(ValueError, match="axis_"):
+        cfg.validate()
+
+
+def test_config_exclusivity_schedule_and_sample_weighting():
+    """A schedule already decided every draw offline, so a second weighting arm layered on top
+    is two arms at once."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+            "--axis_expected_frames",
+            "10",
+            "--sample_weighting.type",
+            "axis_flat",
+        ],
+    )
+    with pytest.raises(ValueError, match="axis_schedule|two arms|sample_weighting"):
+        cfg.validate()
+
+
+def test_config_exclusivity_schedule_requires_expected_frames():
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+        ],
+    )
+    with pytest.raises(ValueError, match="axis_expected_frames"):
+        cfg.validate()
+
+
+def test_config_exclusivity_schedule_with_eval_split():
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+            "--axis_expected_frames",
+            "10",
+            "--dataset.eval_split",
+            "0.1",
+        ],
+    )
+    with pytest.raises(ValueError, match="eval_split"):
+        cfg.validate()
+
+
+def test_make_axis_schedule_sampler_wire_in(tmp_path):
+    """The wire-in helper mirrors _make_axis_sampler's shape: a pure function selecting the
+    sampler, callable without a real dataset."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+    from lerobot.scripts.lerobot_train import _make_axis_schedule_sampler
+
+    p = _schedule_npz(tmp_path, [[1, 2], [3, 4]])
+    s = _make_axis_schedule_sampler(str(p), num_frames=100)
+    assert isinstance(s, AxisScheduleSampler)
+    assert list(iter(s)) == [1, 2, 3, 4]
+
+
+# --- batch alignment / step budget guards -------------------------------------------------------
+
+
+def test_total_steps_and_batch_properties(tmp_path):
+    """The schedule's own (total_steps, batch) shape must be readable off the sampler --
+    consumed by _check_axis_schedule_budget at the wire-in site."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    # 3 steps x 2 batch.
+    p = _schedule_npz(tmp_path, [[1, 2], [3, 4], [5, 6]])
+    s = AxisScheduleSampler(str(p), expected_frames=100)
+    assert s.total_steps == 3
+    assert s.batch == 2
+
+
+class _FakeScheduleSampler:
+    """Stands in for AxisScheduleSampler in _check_axis_schedule_budget tests: the guard is a
+    pure function of (sampler.batch, sampler.total_steps, batch_size, num_train_steps), so it
+    does not need a real .npz artifact -- mirrors the FakeDs pattern _check_axis_frames tests
+    already use."""
+
+    def __init__(self, batch: int, total_steps: int) -> None:
+        self.batch = batch
+        self.total_steps = total_steps
+
+
+class _FakeParallelDims:
+    """Stands in for the real ParallelDims: _check_axis_schedule_budget only reads
+    dp_world_size."""
+
+    def __init__(self, dp_world_size: int = 1) -> None:
+        self.dp_world_size = dp_world_size
+
+
+def _budget(sampler, *, batch_size, num_train_steps, dp_world_size=1, grad_accum_steps=1):
+    """Thin wrapper so the batch/step-budget tests below don't repeat the topology args they
+    don't care about (dp_world_size=1, grad_accum_steps=1 -- single-process, no accumulation)."""
+    from lerobot.scripts.lerobot_train import _check_axis_schedule_budget
+
+    _check_axis_schedule_budget(
+        sampler,
+        batch_size,
+        num_train_steps,
+        _FakeParallelDims(dp_world_size),
+        grad_accum_steps,
+    )
+
+
+def test_check_axis_schedule_budget_refuses_batch_mismatch():
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    with pytest.raises(ValueError, match="batch"):
+        _budget(sampler, batch_size=32, num_train_steps=1000)
+    with pytest.raises(ValueError, match="batch"):
+        _budget(sampler, batch_size=128, num_train_steps=1000)
+
+
+def test_check_axis_schedule_budget_accepts_matching_batch():
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    _budget(sampler, batch_size=64, num_train_steps=1000)  # must not raise
+
+
+def test_check_axis_schedule_budget_refuses_step_overrun():
+    """A budget longer than the schedule would silently replay it from row 0 (the torch loader
+    restarts an exhausted sampler rather than raising)."""
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    with pytest.raises(ValueError, match="exceeds|steps"):
+        _budget(sampler, batch_size=64, num_train_steps=1001)
+
+
+def test_check_axis_schedule_budget_warns_but_allows_short_step_budget(caplog):
+    """Fewer steps than the schedule is allowed (just a truncated run whose coverage numbers no
+    longer describe it), not refused."""
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    with caplog.at_level("WARNING"):
+        _budget(sampler, batch_size=64, num_train_steps=500)  # must not raise
+    assert "short" in caplog.text or "steps" in caplog.text
+
+
+def test_make_dataloaders_wires_in_the_budget_guard(tmp_path):
+    """The guard must actually run at the schedule sampler's construction site, not just exist
+    as a standalone function -- construct via _make_axis_schedule_sampler then call the guard
+    the same way make_dataloaders does, using a schedule/cfg pairing that must be refused."""
+    from lerobot.scripts.lerobot_train import _make_axis_schedule_sampler
+
+    p = _schedule_npz(tmp_path, [[1, 2], [3, 4]])  # batch=2, total_steps=2
+    sampler = _make_axis_schedule_sampler(str(p), num_frames=100)
+    with pytest.raises(ValueError, match="batch"):
+        _budget(sampler, batch_size=1, num_train_steps=2)
+    _budget(sampler, batch_size=2, num_train_steps=2)  # must not raise
+
+
+# --- effective-batch (dp_world_size) and sharded/accumulated-replay topology ---------------------
+
+
+def test_check_axis_schedule_budget_effective_batch_accounts_for_dp_world_size():
+    """The schedule's `batch` is a GLOBAL batch; cfg.batch_size is per-device. With
+    dp_world_size=1 the effective batch equals batch_size directly, so this pins that the
+    comparison is against `batch_size * dp_world_size`, not `batch_size` alone."""
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    _budget(sampler, batch_size=64, num_train_steps=1000, dp_world_size=1)  # must not raise
+
+
+def test_check_axis_schedule_budget_admits_sharded_replay_when_one_step_is_one_schedule_row():
+    """With b * W == the schedule's batch and no accumulation, rank r draws batches r, r+W, ... of
+    the flat stream, so optimizer step k consumes schedule row k exactly: admitted."""
+    sampler = _FakeScheduleSampler(batch=128, total_steps=1000)
+    _budget(sampler, batch_size=64, num_train_steps=1000, dp_world_size=2)  # 64*2 == 128: must not raise
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    _budget(sampler, batch_size=8, num_train_steps=1000, dp_world_size=8)  # 8*8 == 64: must not raise
+
+
+def test_check_axis_schedule_budget_refuses_sharded_replay_whose_step_is_not_a_schedule_row():
+    """With b * W != the schedule's batch a step would split or merge schedule rows: refused,
+    naming the admitted condition."""
+    sampler = _FakeScheduleSampler(batch=128, total_steps=1000)
+    with pytest.raises(
+        ValueError, match=r"dp_world_size=2 > 1 is admitted only when batch_size x dp_world_size"
+    ):
+        _budget(sampler, batch_size=32, num_train_steps=1000, dp_world_size=2)  # 32*2 != 128
+
+
+def test_check_axis_schedule_budget_refuses_sharded_replay_with_accumulation():
+    """Accumulation groups several batches into one optimizer step, so even with b * W == the
+    schedule's batch a step is not one schedule row: refused."""
+    sampler = _FakeScheduleSampler(batch=128, total_steps=1000)
+    with pytest.raises(
+        ValueError, match=r"dp_world_size=2 > 1 is admitted only when .*gradient_accumulation"
+    ):
+        _budget(sampler, batch_size=64, num_train_steps=1000, dp_world_size=2, grad_accum_steps=2)
+
+
+def test_check_axis_schedule_budget_refuses_gradient_accumulation_over_one():
+    """Accumulation groups several of the schedule's batches into one optimizer step: refused on a
+    single process too."""
+    sampler = _FakeScheduleSampler(batch=64, total_steps=1000)
+    with pytest.raises(ValueError, match="gradient_accumulation.steps=2 > 1"):
+        _budget(sampler, batch_size=64, num_train_steps=1000, grad_accum_steps=2)
+
+
+# --- artifact <-> arm binding: mode/reward meta mismatch refusals ------------------------------
+
+
+def test_check_axis_schedule_meta_accepts_matching_mode_and_reward(tmp_path):
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+    from lerobot.scripts.lerobot_train import _check_axis_schedule_meta
+
+    s = AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1, 2]])), expected_frames=100)
+    assert s.meta["mode"] == "drop" and s.meta["reward_id"] == "v2"
+    _check_axis_schedule_meta(s, expected_mode="drop", expected_reward="v2")  # must not raise
+
+
+def test_check_axis_schedule_meta_refuses_mode_mismatch(tmp_path):
+    """Nothing else binds --axis_schedule_path to the arm name a run is launched under -- a
+    mismatched artifact would otherwise train silently under the wrong name."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+    from lerobot.scripts.lerobot_train import _check_axis_schedule_meta
+
+    path = _schedule_npz(tmp_path, [[1, 2]], meta_extra={"mode": "uniform"})
+    s = AxisScheduleSampler(str(path), expected_frames=100)
+    with pytest.raises(ValueError, match="mode"):
+        _check_axis_schedule_meta(s, expected_mode="drop", expected_reward="v2")
+
+
+def test_check_axis_schedule_meta_refuses_reward_mismatch(tmp_path):
+    """Mode alone cannot separate drop_top_v2 from drop_top_phase (same mode, different
+    reward) -- reward_id must be checked too."""
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+    from lerobot.scripts.lerobot_train import _check_axis_schedule_meta
+
+    s = AxisScheduleSampler(str(_schedule_npz(tmp_path, [[1, 2]])), expected_frames=100)
+    with pytest.raises(ValueError, match="reward"):
+        _check_axis_schedule_meta(s, expected_mode="drop", expected_reward="phase")
+
+
+# --- validate() required-flag rules ---------------------------------------------------------------
+
+
+def test_validate_refuses_schedule_without_expected_mode_and_reward():
+    """axis_schedule_path requires axis_expected_mode AND axis_expected_reward -- nothing else
+    binds this run's claimed arm to the schedule artifact's own meta."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+            "--axis_expected_frames",
+            "10",
+        ],
+    )
+    with pytest.raises(ValueError, match="axis_expected_mode"):
+        cfg.validate()
+
+
+def test_validate_accepts_schedule_with_expected_mode_and_reward():
+    """The required-flag rule must not block the intended pairing."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_schedule_path",
+            "/tmp/s.npz",
+            "--axis_expected_frames",
+            "10",
+            "--axis_expected_mode",
+            "drop_top",
+            "--axis_expected_reward",
+            "v2",
+        ],
+    )
+    cfg.validate()  # must not raise
+
+
+# --- the frame-count guard runs on the schedule branch too, before the sampler ------------------
+
+
+def test_make_dataloaders_checks_frames_before_schedule_sampler():
+    """A schedule artifact built against the wrong corpus must be caught by the same cheap
+    frame-count check the axis_rows_path branch already runs (_check_axis_frames), and BEFORE
+    the sampler is constructed -- not surfaced later as a confusing npz-shape error deep inside
+    AxisScheduleSampler.__init__."""
+    import inspect
+
+    from lerobot.scripts.lerobot_train import make_dataloaders
+
+    src = inspect.getsource(make_dataloaders)
+    schedule_branch = src.split("if cfg.axis_schedule_path is not None:", 1)[1]
+    schedule_branch = schedule_branch.split("elif cfg.axis_rows_path is not None:", 1)[0]
+    assert "_check_axis_frames" in schedule_branch
+    assert schedule_branch.index("_check_axis_frames") < schedule_branch.index("_make_axis_schedule_sampler")
